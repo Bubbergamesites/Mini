@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Google</title>
+<link rel="icon" href="https://google.com/favicon.ico" type="image/png">
+<style>
+  :root { --bg:#111827; --panel:#1f2937; --line:#374151; --text:#f3f4f6; --muted:#9ca3af; --accent:#10b981; --err:#f87171; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+
+  #stage { position:fixed; inset:0; }
+  iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#fff; display:none; }
+  iframe.on { display:block; }
+
+  /* home / address overlay (the only UI) */
+  #home { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    text-align:center; padding:20px; background:var(--bg); z-index:2; }
+  #home.hidden { display:none; }
+  #home h1 { font-size:3rem; margin:0 0 4px; letter-spacing:.1em; }
+  #home p { color:var(--muted); margin:0; }
+  #homeForm { display:flex; gap:8px; width:100%; max-width:560px; margin-top:26px; }
+  #urlInput { flex:1; min-width:0; height:48px; padding:0 18px; border-radius:24px; border:1px solid var(--line); background:var(--panel); color:var(--text); font-size:16px; }
+  #urlInput:focus { outline:2px solid var(--accent); border-color:transparent; }
+  #goBtn { height:48px; padding:0 22px; border:0; border-radius:24px; background:var(--accent); color:#062b1f; font-weight:600; font-size:15px; cursor:pointer; }
+  #goBtn:disabled { opacity:.5; cursor:default; }
+  #statusMsg { margin-top:16px; font-size:13px; color:var(--muted); min-height:18px; word-break:break-all; max-width:560px; }
+  #statusMsg.ok { color:var(--accent); } #statusMsg.err { color:var(--err); }
+  #hint { margin-top:14px; font-size:12px; color:var(--muted); opacity:.6; }
+
+  /* thin loading line + transient toast while a page is showing */
+  #progress { position:fixed; top:0; left:0; right:0; height:2px; z-index:5; pointer-events:none; }
+  #progress.on { background:linear-gradient(90deg,transparent,var(--accent),transparent); background-size:50% 100%; background-repeat:no-repeat; animation:slide 1s linear infinite; }
+  @keyframes slide { from{background-position:-50% 0} to{background-position:150% 0} }
+  #toast { position:fixed; left:10px; bottom:10px; max-width:calc(100% - 20px); padding:6px 12px; border-radius:6px; background:rgba(17,24,39,.92);
+    border:1px solid var(--line); color:var(--text); font-size:12px; z-index:5; pointer-events:none; opacity:0; transition:opacity .2s;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #toast.show { opacity:1; } #toast.err { color:var(--err); } #toast.ok { color:var(--accent); }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/libcurl.js@latest/libcurl_full.js"></script>
+</head>
+<body>
+<div id="progress"></div>
+<div id="toast"></div>
+<div id="stage">
+  <iframe id="view" sandbox="allow-scripts allow-forms allow-popups allow-downloads"></iframe>
+  <div id="home">
+    <h1>Mini</h1>
+    <p>the simplest web browser</p>
+    <form id="homeForm" autocomplete="off">
+      <input id="urlInput" type="text" placeholder="Search or enter address" spellcheck="false" autocapitalize="off">
+      <button id="goBtn" type="submit" disabled>Loading WASM...</button>
+    </form>
+    <div id="statusMsg">Initializing WebAssembly runtime...</div>
+    <div id="hint">Alt+← back · Alt+→ forward · Alt+R reload · Ctrl/Alt+L address · Esc close</div>
+  </div>
+</div>
+
+<script>
+const GATEWAY = 'wss://wisp.mercurywork.shop';
+const MAX_META_REFRESH = 5;
+const $ = id => document.getElementById(id);
+const view = $('view'), home = $('home'), urlInput = $('urlInput'), goBtn = $('goBtn');
+
+let ready = false, pending = null;
+let history_ = [], idx = -1, token = 0, blobUrl = null, loading = false, toastTimer = null;
+
+/* ================= UI helpers ================= */
+function setStatus(msg, kind = '') {
+  const s = $('statusMsg'); s.textContent = msg || ''; s.className = kind;
+  // toast only matters while a page is on screen
+  const t = $('toast');
+  clearTimeout(toastTimer);
+  if (msg && home.classList.contains('hidden')) {
+    t.textContent = msg; t.className = 'show ' + kind;
+    if (!loading) toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
+  } else t.className = '';
+}
+function showHome(on) {
+  home.classList.toggle('hidden', !on);
+  if (on) { urlInput.value = idx >= 0 ? history_[idx].url : ''; urlInput.focus(); urlInput.select(); }
+  else $('toast').className = '';
+}
+function setLoading(on) { loading = on; $('progress').classList.toggle('on', on); }
+
+/* ================= helpers ================= */
+function normalizeInput(raw) {
+  const input = raw.trim();
+  if (!input) return null;
+  if (/^(about|data|blob|javascript):/i.test(input)) return null;
+  if (/^https?:\/\//i.test(input)) return input;
+  if (/^\/\//.test(input)) return 'https:' + input;
+  const noSpace = !/\s/.test(input);
+  if (noSpace && /^(localhost|\d{1,3}(\.\d{1,3}){3}|[a-z0-9-]+(\.[a-z0-9-]+)+)(:\d+)?([/?#].*)?$/i.test(input)) {
+    const scheme = /^(localhost|\d{1,3}(\.\d{1,3}){3})/i.test(input) ? 'http://' : 'https://';
+    return scheme + input;
+  }
+  return 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(input);
+}
+function resolveUrl(href, base) { try { return new URL(href, base).href; } catch { return null; } }
+function decodeBody(buf, contentType) {
+  let charset = (/charset=([^;\s]+)/i.exec(contentType || '') || [])[1];
+  if (!charset) {
+    const head = new TextDecoder('latin1').decode(buf.slice(0, 2048));
+    charset = (/<meta[^>]+charset=["']?\s*([\w-]+)/i.exec(head) || [])[1];
+  }
+  try { return new TextDecoder(charset || 'utf-8').decode(buf); }
+  catch { return new TextDecoder('utf-8').decode(buf); }
+}
+function decodeEntities(s) { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
+function hostOf(u) { try { return new URL(u).host; } catch { return u; } }
+function filenameFrom(disp, url) {
+  const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(disp || '');
+  if (m) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } }
+  try { return decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'download'); } catch { return 'download'; }
+}
+function saveBlob(blob, name) {
+  const u = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(u), 10000);
+}
+
+/* ================= injected into every proxied page ================= */
+const INJECT = `<script>(function(){
+  var P = function(m){ parent.postMessage(Object.assign({mini:1}, m), '*'); };
+  var skip = /^(#|javascript:|mailto:|tel:|sms:|data:|blob:)/i;
+
+  document.addEventListener('click', function(e){
+    if (e.defaultPrevented) return;
+    var a = e.target.closest && e.target.closest('a[href], area[href]');
+    if (!a) return;
+    var raw = a.getAttribute('href');
+    if (!raw || skip.test(raw.trim())) return;
+    e.preventDefault();
+    if (a.hasAttribute('download')) { P({type:'download', url:a.href, name:a.getAttribute('download')}); return; }
+    P({type:'nav', url:a.href});
+  }, true);
+
+  document.addEventListener('auxclick', function(e){
+    var a = e.target.closest && e.target.closest('a[href]');
+    if (e.button === 1 && a) {
+      e.preventDefault();
+      var raw = a.getAttribute('href');
+      if (raw && !skip.test(raw.trim())) P({type:'nav', url:a.href});
+    }
+  }, true);
+
+  document.addEventListener('submit', function(e){
+    var f = e.target; if (e.defaultPrevented) return;
+    e.preventDefault();
+    var sub = e.submitter;
+    var action = (sub && sub.getAttribute('formaction')) || f.getAttribute('action');
+    var url = action ? new URL(action, document.baseURI).href : document.baseURI;
+    var method = ((sub && sub.getAttribute('formmethod')) || f.getAttribute('method') || 'get').toLowerCase();
+    var fd = new FormData(f);
+    if (sub && sub.name) fd.append(sub.name, sub.value);
+    var usp = new URLSearchParams();
+    fd.forEach(function(v,k){ usp.append(k, typeof v === 'string' ? v : (v.name || '')); });
+    if (method === 'post') {
+      P({type:'nav', url:url, method:'POST', body:usp.toString(), contentType:'application/x-www-form-urlencoded'});
+    } else {
+      var u = new URL(url); u.search = ''; usp.forEach(function(v,k){ u.searchParams.append(k, v); }); u.hash = '';
+      P({type:'nav', url:u.href});
+    }
+  }, true);
+
+  // no tabs: popups and target=_blank load in the same view
+  window.open = function(u){ if (u) P({type:'nav', url:new URL(u, document.baseURI).href}); return null; };
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('a[target], form[target]').forEach(function(n){ n.removeAttribute('target'); });
+  });
+  window.addEventListener('hashchange', function(){ P({type:'hash', url:document.baseURI.split('#')[0] + location.hash}); });
+
+  // keyboard shortcuts keep working while the page has focus
+  document.addEventListener('keydown', function(e){
+    if ((e.altKey || e.ctrlKey || e.metaKey) || e.key === 'Escape') {
+      var k = {type:'key', key:e.key, alt:e.altKey, ctrl:e.ctrlKey, meta:e.metaKey};
+      if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
+      P(k);
+    }
+  }, true);
+})();<\/script>`;
+
+/* ================= core loader ================= */
+async function navigate(target, opts = {}) {
+  const { method = 'GET', body, contentType, push = true, metaDepth = 0 } = opts;
+  if (!ready) { pending = { target, opts }; setStatus('Waiting for runtime…'); return; }
+  const my = ++token;
+  setLoading(true);
+  setStatus('Loading ' + target + '…');
+
+  try {
+    const headers = { 'User-Agent': navigator.userAgent };
+    if (body != null) headers['Content-Type'] = contentType || 'application/x-www-form-urlencoded';
+    const init = { method, headers, redirect: 'follow' };
+    if (body != null && method !== 'GET') init.body = body;
+
+    const res = await libcurl.fetch(target, init);
+    if (my !== token) return;
+
+    const finalUrl = res.url || target;
+    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    const disp = res.headers.get('content-disposition') || '';
+
+    const refreshHdr = res.headers.get('refresh');
+    if (refreshHdr && metaDepth < MAX_META_REFRESH) {
+      const m = /url=\s*['"]?([^'";]+)/i.exec(refreshHdr);
+      if (m) { const u = resolveUrl(m[1], finalUrl); if (u) return navigate(u, { push, metaDepth: metaDepth + 1 }); }
+    }
+
+    const buf = await res.arrayBuffer();
+    if (my !== token) return;
+
+    const finishDownload = () => {
+      const name = filenameFrom(disp, finalUrl);
+      saveBlob(new Blob([buf], { type: ctype }), name);
+      setLoading(false);
+      setStatus('Downloaded ' + name, 'ok');
+    };
+    if (/attachment/i.test(disp)) return finishDownload();
+
+    let page;
+    const isHtml = !ctype || /text\/html|application\/xhtml/.test(ctype);
+    if (isHtml) {
+      let html = decodeBody(buf, ctype);
+
+      const mr = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["']?\s*\d*\s*;?\s*url=\s*['"]?([^'">\s]+)/i.exec(html);
+      if (mr && metaDepth < MAX_META_REFRESH) {
+        const u = resolveUrl(decodeEntities(mr[1]), finalUrl);
+        if (u && u !== finalUrl) return navigate(u, { push, metaDepth: metaDepth + 1 });
+      }
+
+      const pb = /<base[^>]+href=["']([^"']+)["']/i.exec(html);
+      const baseHref = pb ? (resolveUrl(pb[1], finalUrl) || finalUrl) : finalUrl;
+
+      html = html.replace(/<meta[^>]+http-equiv=["']?(content-security-policy|x-frame-options|refresh)["']?[^>]*>/gi, '')
+                 .replace(/<base\b[^>]*>/gi, '')
+                 .replace(/\sintegrity=("[^"]*"|'[^']*')/gi, '')
+                 .replace(/\scrossorigin(=("[^"]*"|'[^']*'|[^\s>]+))?/gi, '');
+
+      const inject = `<base href="${baseHref.replace(/"/g, '&quot;')}">` + INJECT;
+      if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, m => m + inject);
+      else if (/<html[^>]*>/i.test(html)) html = html.replace(/<html[^>]*>/i, m => m + '<head>' + inject + '</head>');
+      else html = '<!DOCTYPE html><head>' + inject + '</head>' + html;
+      page = { html };
+    } else if (/^(image|video|audio)\/|application\/pdf|^text\/|json|xml/.test(ctype)) {
+      page = { blob: new Blob([buf], { type: ctype }) };
+    } else {
+      return finishDownload();
+    }
+
+    const entry = { url: finalUrl, method, body, contentType };
+    if (push || idx < 0) { history_ = history_.slice(0, idx + 1); history_.push(entry); idx = history_.length - 1; }
+    else history_[idx] = entry;
+
+    showPage(page);
+    showHome(false);
+    setStatus(finalUrl !== target ? 'Redirected to ' + finalUrl : (res.ok ? '' : `HTTP ${res.status}`), res.ok ? '' : 'err');
+  } catch (err) {
+    if (my !== token) return;
+    console.error(err);
+    showError(target, err);
+  } finally {
+    if (my === token) setLoading(false);
+  }
+}
+
+function showPage(page) {
+  if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+  if (page.html != null) { view.removeAttribute('src'); view.srcdoc = page.html; }
+  else { blobUrl = URL.createObjectURL(page.blob); view.removeAttribute('srcdoc'); view.src = blobUrl; }
+  view.classList.add('on');
+}
+
+function showError(target, err) {
+  const msg = String(err && err.message || err);
+  const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  showPage({ html: `<!DOCTYPE html><meta charset="utf-8"><body style="font-family:system-ui;background:#111827;color:#f3f4f6;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">
+    <div style="max-width:480px;padding:20px"><h2 style="margin:0 0 8px">Can't reach this page</h2>
+    <p style="color:#9ca3af;word-break:break-all">${esc(target)}</p><p style="color:#f87171">${esc(msg)}</p>
+    <p style="color:#9ca3af;font-size:14px">Check the address, or press Alt+R to try again.</p></div></body>` });
+  if (idx < 0 || history_[idx].url !== target) {
+    history_ = history_.slice(0, idx + 1); history_.push({ url: target, method: 'GET' });
+    idx = history_.length - 1;
+  }
+  showHome(false);
+  setStatus('Failed to load: ' + msg, 'err');
+}
+
+async function downloadUrl(url, name) {
+  try {
+    setStatus('Downloading…');
+    const res = await libcurl.fetch(url, { headers: { 'User-Agent': navigator.userAgent } });
+    saveBlob(new Blob([await res.arrayBuffer()], { type: res.headers.get('content-type') || '' }),
+             name || filenameFrom(res.headers.get('content-disposition'), res.url || url));
+    setStatus('Download complete', 'ok');
+  } catch (e) { setStatus('Download failed: ' + e.message, 'err'); }
+}
+
+/* ================= history / keyboard (no toolbar) ================= */
+function goBack()    { if (idx > 0) { idx--; const h = history_[idx]; navigate(h.url, { ...h, push: false }); } }
+function goForward() { if (idx < history_.length - 1) { idx++; const h = history_[idx]; navigate(h.url, { ...h, push: false }); } }
+function reload()    { if (idx >= 0) { const h = history_[idx]; navigate(h.url, { ...h, push: false }); } }
+
+function handleKey(k) {
+  const key = (k.key || '').toLowerCase(), mod = k.ctrl || k.meta;
+  if (k.alt && k.key === 'ArrowLeft') goBack();
+  else if (k.alt && k.key === 'ArrowRight') goForward();
+  else if (k.alt && key === 'r') reload();
+  else if ((mod || k.alt) && key === 'l') showHome(true);
+  else if (k.alt && key === 'home') { showHome(true); }
+  else if (k.key === 'Escape' && idx >= 0 && !home.classList.contains('hidden')) showHome(false);
+}
+document.addEventListener('keydown', e => {
+  const k = { key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey };
+  if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
+  handleKey(k);
+});
+
+/* ================= messages from proxied pages ================= */
+window.addEventListener('message', e => {
+  const d = e.data;
+  if (!d || !d.mini || e.source !== view.contentWindow) return;
+  if (d.type === 'nav' && /^https?:/i.test(d.url)) {
+    navigate(d.url, { method: d.method || 'GET', body: d.body, contentType: d.contentType });
+  } else if (d.type === 'download') {
+    downloadUrl(d.url, d.name);
+  } else if (d.type === 'hash') {
+    if (idx >= 0) history_[idx] = { ...history_[idx], url: d.url };
+  } else if (d.type === 'key') {
+    handleKey(d);
+  }
+});
+
+/* ================= wiring ================= */
+$('homeForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const t = normalizeInput(urlInput.value);
+  if (t) navigate(t);
+});
+
+function initialTarget() {
+  const q = new URLSearchParams(location.search).get('url') || decodeURIComponent(location.hash.slice(1));
+  return q ? normalizeInput(q) : null;
+}
+
+window.addEventListener('load', async () => {
+  urlInput.focus();
+  try {
+    await libcurl.ready;
+    libcurl.set_websocket(GATEWAY);
+    ready = true;
+    goBtn.disabled = false; goBtn.textContent = 'Go';
+    setStatus('Ready!', 'ok');
+    const init = initialTarget();
+    if (pending) { const p = pending; pending = null; navigate(p.target, p.opts); }
+    else if (init) navigate(init);
+  } catch (e) {
+    console.error(e);
+    goBtn.textContent = 'Failed';
+    setStatus('WASM init failed: ' + e.message, 'err');
+  }
+});
+</script>
+</body>
+</html>
