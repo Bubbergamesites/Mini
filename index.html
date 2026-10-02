@@ -60,6 +60,7 @@
 
 <script>
 const GATEWAY = 'wss://wisp.mercurywork.shop';
+const LIBCURL_BASE = 'https://cdn.jsdelivr.net/npm/libcurl.js@latest/';
 const MAX_META_REFRESH = 5;
 const $ = id => document.getElementById(id);
 const view = $('view'), home = $('home'), urlInput = $('urlInput'), goBtn = $('goBtn');
@@ -346,10 +347,23 @@ function initialTarget() {
   return q ? normalizeInput(q) : null;
 }
 
+// libcurl.ready is a boolean (not a promise), and the WASM must be loaded explicitly
+function loadLibcurl() {
+  return new Promise((resolve, reject) => {
+    if (libcurl.ready) return resolve();
+    const timer = setTimeout(() => reject(new Error('timed out loading libcurl.wasm')), 30000);
+    libcurl.onload = () => { clearTimeout(timer); resolve(); };
+    try {
+      const r = libcurl.load_wasm(LIBCURL_BASE + 'libcurl.wasm');
+      if (r && typeof r.catch === 'function') r.catch(e => { clearTimeout(timer); reject(e); });
+    } catch (e) { clearTimeout(timer); reject(e); }
+  });
+}
+
 window.addEventListener('load', async () => {
   urlInput.focus();
   try {
-    await libcurl.ready;
+    await loadLibcurl();
     libcurl.set_websocket(GATEWAY);
     ready = true;
     goBtn.disabled = false; goBtn.textContent = 'Go';
