@@ -1,7 +1,5 @@
 # MINI — the simplest web browser
-
-<img width="750" height="469" alt="3dhkilcv7lqk_01a0fe4d-8fa9-74d0-8d08-4da92a46a511" src="https://github.com/user-attachments/assets/0574aeeb-f9d2-4af5-be4c-ee8940820b0a" />
-
+<img width="750" height="469" alt="3dhkilcv7lqk_01a0fe4d-8fa9-74d0-8d08-4da92a46a511 (1)" src="https://github.com/user-attachments/assets/fc92bed6-c1cb-4250-8355-7f44b64ae212" />
 MINI is a complete web browser in **one HTML file**. There is no server to run, no build step, and no dependencies to install. You open `MINI.html`, type an address or a search, and the page loads inside MINI.
 
 It has **no tabs, no toolbar, and no hotbar**. The interface is a single full-screen view. The only visible UI is a search box on the home screen, a thin loading line, and a small status toast.
