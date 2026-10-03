@@ -86,7 +86,7 @@ Both forms accept anything you could type in the search box. They also accept se
   | `//example.com` | Uses `https:` |
   | `example.com`, `sub.site.org/path?x=1` | Adds `https://` |
   | `localhost:3000`, `192.168.1.5` | Adds `http://` |
-  | `how do magnets work` | Searches on DuckDuckGo's HTML page |
+  | `how do magnets work` | Searches on Brave's search page |
   | `javascript:`, `data:`, `blob:` and `about:` | Rejected |
 
 - **Link navigation.** Clicking a link loads it in the same view. `target="_blank"` and `window.open()` also load in the same view, since there are no tabs. Middle-click behaves the same way.
