@@ -45,12 +45,12 @@
 <div id="progress"></div>
 <div id="toast"></div>
 <div id="stage">
-  <iframe id="view" sandbox="allow-scripts allow-forms allow-popups allow-downloads"></iframe>
+  <iframe id="view" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"></iframe>
   <div id="home">
     <h1>Mini</h1>
     <p>the simplest web browser</p>
     <form id="homeForm" autocomplete="off">
-      <input id="urlInput" type="text" placeholder="Search or enter address" spellcheck="false" autocapitalize="off">
+      <input id="urlInput" type="text" placeholder="Search or enter address" spellcheck="false" autocapitalize="off" autocorrect="off" inputmode="url" enterkeyhint="go">
       <button id="goBtn" type="submit" disabled>Loading WASM...</button>
     </form>
     <div id="statusMsg">Initializing WebAssembly runtime...</div>
@@ -125,61 +125,158 @@ function saveBlob(blob, name) {
 
 /* ================= injected into every proxied page ================= */
 const INJECT = `<script>(function(){
-  var P = function(m){ parent.postMessage(Object.assign({mini:1}, m), '*'); };
-  var skip = /^(#|javascript:|mailto:|tel:|sms:|data:|blob:)/i;
+  var P = function(m, t){ parent.postMessage(Object.assign({mini:1}, m), '*', t || []); };
+  var nav = function(url, x){ x = x || {}; P(Object.assign({type:'nav', url:url}, x), x.body instanceof ArrayBuffer ? [x.body] : []); };
+  var pend = {}, seq = 0;
 
-  document.addEventListener('click', function(e){
-    if (e.defaultPrevented) return;
+  /* ---- links (bubble phase, so the page's own handlers run first and can cancel) ---- */
+  function jump(h){
+    var id; try { id = decodeURIComponent(h.slice(1)); } catch(_) { id = h.slice(1); }
+    var el = id && (document.getElementById(id) || document.getElementsByName(id)[0]);
+    if (el) el.scrollIntoView(); else if (!id || id.toLowerCase() === 'top') window.scrollTo(0, 0);
+    P({type:'hash', url:document.baseURI.split('#')[0] + h});
+  }
+  window.addEventListener('click', function(e){
+    if (e.defaultPrevented || e.button) return;
     var a = e.target.closest && e.target.closest('a[href], area[href]');
     if (!a) return;
-    var raw = a.getAttribute('href');
-    if (!raw || skip.test(raw.trim())) return;
+    var raw = (a.getAttribute('href') || '').trim();
+    if (!raw || /^(javascript:|mailto:|tel:|sms:|data:|blob:)/i.test(raw)) return;
     e.preventDefault();
-    if (a.hasAttribute('download')) { P({type:'download', url:a.href, name:a.getAttribute('download')}); return; }
-    P({type:'nav', url:a.href});
-  }, true);
-
-  document.addEventListener('auxclick', function(e){
+    if (raw.charAt(0) === '#') return jump(raw);
+    if (a.hasAttribute('download')) return P({type:'download', url:a.href, name:a.getAttribute('download')});
+    nav(a.href);
+  }, false);
+  window.addEventListener('auxclick', function(e){
     var a = e.target.closest && e.target.closest('a[href]');
-    if (e.button === 1 && a) {
-      e.preventDefault();
-      var raw = a.getAttribute('href');
-      if (raw && !skip.test(raw.trim())) P({type:'nav', url:a.href});
-    }
-  }, true);
-
-  document.addEventListener('submit', function(e){
-    var f = e.target; if (e.defaultPrevented) return;
+    if (e.button !== 1 || !a) return;
     e.preventDefault();
-    var sub = e.submitter;
+    var raw = (a.getAttribute('href') || '').trim();
+    if (raw && !/^(#|javascript:|mailto:|tel:|sms:|data:|blob:)/i.test(raw)) nav(a.href);
+  }, false);
+
+  /* ---- forms: urlencoded, multipart (file uploads), text/plain, formaction/formmethod/formenctype ---- */
+  function sendForm(f, sub){
     var action = (sub && sub.getAttribute('formaction')) || f.getAttribute('action');
-    var url = action ? new URL(action, document.baseURI).href : document.baseURI;
+    var url = action ? new URL(action, document.baseURI).href : document.baseURI.split('#')[0];
     var method = ((sub && sub.getAttribute('formmethod')) || f.getAttribute('method') || 'get').toLowerCase();
+    if (method === 'dialog') return;
+    var enc = ((sub && sub.getAttribute('formenctype')) || f.getAttribute('enctype') || 'application/x-www-form-urlencoded').toLowerCase();
     var fd = new FormData(f);
     if (sub && sub.name) fd.append(sub.name, sub.value);
-    var usp = new URLSearchParams();
-    fd.forEach(function(v,k){ usp.append(k, typeof v === 'string' ? v : (v.name || '')); });
-    if (method === 'post') {
-      P({type:'nav', url:url, method:'POST', body:usp.toString(), contentType:'application/x-www-form-urlencoded'});
-    } else {
-      var u = new URL(url); u.search = ''; usp.forEach(function(v,k){ u.searchParams.append(k, v); }); u.hash = '';
-      P({type:'nav', url:u.href});
+    var str = function(v){ return typeof v === 'string' ? v : (v.name || ''); };
+    if (method !== 'post') {
+      var u = new URL(url); u.search = ''; u.hash = '';
+      fd.forEach(function(v, k){ u.searchParams.append(k, str(v)); });
+      return nav(u.href);
     }
-  }, true);
+    if (enc === 'multipart/form-data') {
+      var r = new Response(fd);
+      r.arrayBuffer().then(function(buf){ nav(url, {method:'POST', body:buf, contentType:r.headers.get('content-type')}); });
+    } else if (enc === 'text/plain') {
+      var t = ''; fd.forEach(function(v, k){ t += k + '=' + str(v) + String.fromCharCode(13, 10); });
+      nav(url, {method:'POST', body:t, contentType:'text/plain'});
+    } else {
+      var usp = new URLSearchParams(); fd.forEach(function(v, k){ usp.append(k, str(v)); });
+      nav(url, {method:'POST', body:usp.toString(), contentType:'application/x-www-form-urlencoded'});
+    }
+  }
+  window.addEventListener('submit', function(e){
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    sendForm(e.target, e.submitter);
+  }, false);
+  // form.submit() fires no submit event, so route it here too
+  HTMLFormElement.prototype.submit = function(){ sendForm(this, null); };
 
-  // no tabs: popups and target=_blank load in the same view
-  window.open = function(u){ if (u) P({type:'nav', url:new URL(u, document.baseURI).href}); return null; };
-  document.addEventListener('DOMContentLoaded', function(){
-    document.querySelectorAll('a[target], form[target]').forEach(function(n){ n.removeAttribute('target'); });
-  });
+  /* ---- no tabs: popups load in the same view ---- */
+  window.open = function(u){ if (u) nav(new URL(u, document.baseURI).href); return null; };
   window.addEventListener('hashchange', function(){ P({type:'hash', url:document.baseURI.split('#')[0] + location.hash}); });
 
-  // keyboard shortcuts keep working while the page has focus
+  // pushState/replaceState throw in a sandboxed srcdoc frame; swallow so SPAs keep running
+  ['pushState', 'replaceState'].forEach(function(n){
+    var o = history[n];
+    history[n] = function(){ try { return o.apply(this, arguments); } catch(_) {} };
+  });
+
+  /* ---- fetch / XMLHttpRequest go through the parent (libcurl), so CORS doesn't block them ---- */
+  function rpc(msg, transfer){
+    return new Promise(function(res, rej){ var id = ++seq; pend[id] = {res:res, rej:rej}; P(Object.assign({type:'fetch', id:id}, msg), transfer); });
+  }
+  window.addEventListener('message', function(e){
+    var d = e.data;
+    if (e.source !== parent || !d || !d.miniRes) return;
+    var p = pend[d.id]; if (!p) return;
+    delete pend[d.id];
+    if (d.error) p.rej(new TypeError(d.error)); else p.res(d);
+  });
+  window.fetch = function(input, init){
+    var req;
+    try { req = new Request(input, init); } catch(err) { return Promise.reject(err); }
+    return req.arrayBuffer().then(function(buf){
+      var h = []; req.headers.forEach(function(v, k){ h.push([k, v]); });
+      var has = buf.byteLength > 0;
+      return rpc({url:req.url, method:req.method, headers:h, body:has ? buf : null}, has ? [buf] : []);
+    }).then(function(d){
+      var empty = d.status === 204 || d.status === 205 || d.status === 304;
+      var r = new Response(empty ? null : d.body, {status:d.status, statusText:d.statusText, headers:d.headers});
+      try { Object.defineProperty(r, 'url', {value:d.url}); } catch(_) {}
+      return r;
+    });
+  };
+
+  function XHR(){ this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = null; this.responseType = ''; this.responseURL = ''; this.withCredentials = false; this.timeout = 0; this.upload = {addEventListener:function(){}}; this._h = []; this._l = {}; }
+  XHR.UNSENT = 0; XHR.OPENED = 1; XHR.HEADERS_RECEIVED = 2; XHR.LOADING = 3; XHR.DONE = 4;
+  var X = XHR.prototype;
+  X._e = function(t){
+    var ev = {type:t, target:this, currentTarget:this};
+    if (typeof this['on' + t] === 'function') { try { this['on' + t](ev); } catch(x) { console.error(x); } }
+    (this._l[t] || []).slice().forEach(function(f){ try { f.call(this, ev); } catch(x) { console.error(x); } }, this);
+  };
+  X._rs = function(n){ this.readyState = n; this._e('readystatechange'); };
+  X.open = function(m, u){ this._m = String(m).toUpperCase(); this._u = new URL(u, document.baseURI).href; this._rs(1); };
+  X.setRequestHeader = function(k, v){ this._h.push([k, v]); };
+  X.overrideMimeType = function(){};
+  X.addEventListener = function(t, f){ (this._l[t] = this._l[t] || []).push(f); };
+  X.removeEventListener = function(t, f){ var a = this._l[t] || [], i = a.indexOf(f); if (i > -1) a.splice(i, 1); };
+  X.abort = function(){ this._x = 1; this._e('abort'); };
+  X.getResponseHeader = function(k){
+    var v = (this._rh || []).filter(function(h){ return h[0].toLowerCase() === String(k).toLowerCase(); }).map(function(h){ return h[1]; });
+    return v.length ? v.join(', ') : null;
+  };
+  X.getAllResponseHeaders = function(){ return (this._rh || []).map(function(h){ return h[0] + ': ' + h[1] + String.fromCharCode(13, 10); }).join(''); };
+  X.send = function(body){
+    var x = this, rr = body == null ? null : new Response(body);
+    (rr ? rr.arrayBuffer() : Promise.resolve(null)).then(function(buf){
+      var h = x._h.slice(), ct = rr && rr.headers.get('content-type'), has = buf && buf.byteLength > 0;
+      if (ct && !h.some(function(p){ return p[0].toLowerCase() === 'content-type'; })) h.push(['Content-Type', ct]);
+      return rpc({url:x._u, method:x._m, headers:h, body:has ? buf : null}, has ? [buf] : []);
+    }).then(function(d){
+      if (x._x) return;
+      x._rh = d.headers; x.status = d.status; x.statusText = d.statusText; x.responseURL = d.url;
+      x._rs(2); x._rs(3);
+      var t = x.responseType;
+      if (t === 'arraybuffer') x.response = d.body;
+      else if (t === 'blob') x.response = new Blob([d.body]);
+      else {
+        var txt = new TextDecoder().decode(d.body);
+        x.responseText = txt;
+        x.response = t === 'json' ? (function(){ try { return JSON.parse(txt); } catch(_) { return null; } })()
+                   : t === 'document' ? new DOMParser().parseFromString(txt, 'text/html') : txt;
+      }
+      x._rs(4); x._e('load'); x._e('loadend');
+    }).catch(function(){ if (x._x) return; x._rs(4); x._e('error'); x._e('loadend'); });
+  };
+  window.XMLHttpRequest = XHR;
+
+  /* ---- keyboard shortcuts keep working while the page has focus ---- */
   document.addEventListener('keydown', function(e){
+    if (e.getModifierState && e.getModifierState('AltGraph')) return;   // AltGr is how some layouts type @ \\ { }
+    var t = e.target, ed = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+    if (ed && e.key.indexOf('Arrow') === 0) return;                      // let Alt+Arrow word-jump work in fields
     if ((e.altKey || e.ctrlKey || e.metaKey) || e.key === 'Escape') {
-      var k = {type:'key', key:e.key, alt:e.altKey, ctrl:e.ctrlKey, meta:e.metaKey};
       if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
-      P(k);
+      P({type:'key', key:e.key, alt:e.altKey, ctrl:e.ctrlKey, meta:e.metaKey});
     }
   }, true);
 })();<\/script>`;
@@ -196,7 +293,11 @@ async function navigate(target, opts = {}) {
     const headers = { 'User-Agent': navigator.userAgent };
     if (body != null) headers['Content-Type'] = contentType || 'application/x-www-form-urlencoded';
     const init = { method, headers, redirect: 'follow' };
-    if (body != null && method !== 'GET') init.body = body;
+    if (body != null && method !== 'GET') init.body = body instanceof ArrayBuffer ? new Uint8Array(body) : body;
+    if (body != null && idx >= 0) {
+      headers['Referer'] = history_[idx].url;
+      try { headers['Origin'] = new URL(history_[idx].url).origin; } catch {}
+    }
 
     const res = await libcurl.fetch(target, init);
     if (my !== token) return;
@@ -252,7 +353,9 @@ async function navigate(target, opts = {}) {
       return finishDownload();
     }
 
-    const entry = { url: finalUrl, method, body, contentType };
+    const entry = (finalUrl !== target && method !== 'GET')
+      ? { url: finalUrl, method: 'GET' }
+      : { url: finalUrl, method, body, contentType };
     if (push || idx < 0) { history_ = history_.slice(0, idx + 1); history_.push(entry); idx = history_.length - 1; }
     else history_[idx] = entry;
 
@@ -300,6 +403,28 @@ async function downloadUrl(url, name) {
   } catch (e) { setStatus('Download failed: ' + e.message, 'err'); }
 }
 
+async function proxyFetch(d, src) {
+  const reply = m => { try { src.postMessage(Object.assign({ miniRes: 1, id: d.id }, m), '*', m.body ? [m.body] : []); } catch {} };
+  try {
+    if (!ready) throw new Error('runtime not ready');
+    if (!/^https?:/i.test(d.url)) throw new Error('unsupported URL');
+    const headers = { 'User-Agent': navigator.userAgent };
+    (d.headers || []).forEach(([k, v]) => { headers[k] = v; });
+    const cur = idx >= 0 ? history_[idx].url : '';
+    const hasBody = d.body && d.method !== 'GET' && d.method !== 'HEAD';
+    if (cur && d.method !== 'GET' && d.method !== 'HEAD') {
+      headers['Referer'] = headers['Referer'] || cur;
+      try { headers['Origin'] = headers['Origin'] || new URL(cur).origin; } catch {}
+    }
+    const init = { method: d.method, headers, redirect: 'follow' };
+    if (hasBody) init.body = new Uint8Array(d.body);
+    const res = await libcurl.fetch(d.url, init);
+    const body = await res.arrayBuffer();
+    const hs = []; res.headers.forEach((v, k) => hs.push([k, v]));
+    reply({ status: res.status, statusText: res.statusText || '', headers: hs, url: res.url || d.url, body });
+  } catch (err) { reply({ error: String((err && err.message) || err) }); }
+}
+
 /* ================= history / keyboard (no toolbar) ================= */
 function goBack()    { if (idx > 0) { idx--; const h = history_[idx]; navigate(h.url, { ...h, push: false }); } }
 function goForward() { if (idx < history_.length - 1) { idx++; const h = history_[idx]; navigate(h.url, { ...h, push: false }); } }
@@ -315,6 +440,8 @@ function handleKey(k) {
   else if (k.key === 'Escape' && idx >= 0 && !home.classList.contains('hidden')) showHome(false);
 }
 document.addEventListener('keydown', e => {
+  if (e.getModifierState && e.getModifierState('AltGraph')) return;
+  if (e.key.startsWith('Arrow') && e.target.closest && e.target.closest('input,textarea,[contenteditable]')) return;
   const k = { key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey };
   if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
   handleKey(k);
@@ -326,6 +453,8 @@ window.addEventListener('message', e => {
   if (!d || !d.mini || e.source !== view.contentWindow) return;
   if (d.type === 'nav' && /^https?:/i.test(d.url)) {
     navigate(d.url, { method: d.method || 'GET', body: d.body, contentType: d.contentType });
+  } else if (d.type === 'fetch') {
+    proxyFetch(d, e.source);
   } else if (d.type === 'download') {
     downloadUrl(d.url, d.name);
   } else if (d.type === 'hash') {
