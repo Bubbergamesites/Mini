@@ -45,7 +45,7 @@
 <div id="progress"></div>
 <div id="toast"></div>
 <div id="stage">
-  <iframe id="view" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals allow-pointer-lock allow-presentation allow-orientation-lock" allow="fullscreen; autoplay; clipboard-write; encrypted-media; picture-in-picture; gamepad; web-share"></iframe>
+  <iframe id="view" sandbox="allow-scripts allow-forms allow-popups allow-downloads"></iframe>
   <div id="home">
     <h1>Mini</h1>
     <p>the simplest web browser</p>
@@ -54,7 +54,7 @@
       <button id="goBtn" type="submit" disabled>Loading WASM...</button>
     </form>
     <div id="statusMsg">Initializing WebAssembly runtime...</div>
-    <div id="hint">Alt+← back · Alt+→ forward · Alt+R reload · Ctrl/Alt+L address · Esc close · Alt+Shift+Del clear cookies/data</div>
+    <div id="hint">Alt+← back · Alt+→ forward · Alt+R reload · Ctrl/Alt+L address · Esc close</div>
   </div>
 </div>
 
@@ -71,6 +71,7 @@ let history_ = [], idx = -1, token = 0, blobUrl = null, loading = false, toastTi
 /* ================= UI helpers ================= */
 function setStatus(msg, kind = '') {
   const s = $('statusMsg'); s.textContent = msg || ''; s.className = kind;
+  // toast only matters while a page is on screen
   const t = $('toast');
   clearTimeout(toastTimer);
   if (msg && home.classList.contains('hidden')) {
@@ -110,6 +111,7 @@ function decodeBody(buf, contentType) {
   catch { return new TextDecoder('utf-8').decode(buf); }
 }
 function decodeEntities(s) { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
+function hostOf(u) { try { return new URL(u).host; } catch { return u; } }
 function filenameFrom(disp, url) {
   const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(disp || '');
   if (m) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } }
@@ -120,517 +122,83 @@ function saveBlob(blob, name) {
   a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(u), 10000);
 }
-const safeJson = o => JSON.stringify(o).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
-const hasHeader = (h, n) => Object.keys(h).some(k => k.toLowerCase() === n);
 
-/* ================= persistent storage (cookies + per-site localStorage) ================= */
-const store = {
-  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
-  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
-  clearAll() { try { Object.keys(localStorage).filter(k => k.startsWith('mini:')).forEach(k => localStorage.removeItem(k)); } catch {} }
-};
-let jar = [];
-try { jar = JSON.parse(store.get('mini:jar') || '[]'); } catch {}
-const saveJar = () => store.set('mini:jar', JSON.stringify(jar));
-const hostMatch = (host, c) => c.hostOnly ? host === c.domain : (host === c.domain || host.endsWith('.' + c.domain));
-const pathMatch = (p, cp) => p === cp || (p.startsWith(cp) && (cp.endsWith('/') || p[cp.length] === '/'));
+/* ================= injected into every proxied page ================= */
+const INJECT = `<script>(function(){
+  var P = function(m){ parent.postMessage(Object.assign({mini:1}, m), '*'); };
+  var skip = /^(#|javascript:|mailto:|tel:|sms:|data:|blob:)/i;
 
-function cookiesFor(url, forJs) {
-  let u; try { u = new URL(url); } catch { return []; }
-  const now = Date.now();
-  return jar.filter(c => (!c.exp || c.exp > now) && hostMatch(u.hostname, c) && pathMatch(u.pathname || '/', c.path)
-      && (!c.secure || u.protocol === 'https:') && !(forJs && c.httpOnly))
-    .sort((a, b) => b.path.length - a.path.length);
-}
-const cookieHeader = url => cookiesFor(url, false).map(c => c.name + '=' + c.value).join('; ');
-const pageCookies = url => cookiesFor(url, true).map(c => c.name + '=' + c.value).join('; ');
-
-function setCookieStr(str, url, fromJs) {
-  let u; try { u = new URL(url); } catch { return; }
-  const parts = String(str).split(';');
-  const eq = parts[0].indexOf('=');
-  const name = eq >= 0 ? parts[0].slice(0, eq).trim() : '';
-  const value = eq >= 0 ? parts[0].slice(eq + 1).trim() : parts[0].trim();
-  if (!name && !value) return;
-  const c = { name, value, domain: u.hostname, hostOnly: true, path: u.pathname.replace(/\/[^\/]*$/, '') || '/',
-              secure: false, httpOnly: false, exp: 0 };
-  let maxAge = null;
-  for (const attr of parts.slice(1)) {
-    const i = attr.indexOf('=');
-    const k = (i >= 0 ? attr.slice(0, i) : attr).trim().toLowerCase();
-    const v = i >= 0 ? attr.slice(i + 1).trim() : '';
-    if (k === 'domain') {
-      const d = v.replace(/^\./, '').toLowerCase();
-      if (u.hostname === d || u.hostname.endsWith('.' + d)) { c.domain = d; c.hostOnly = false; } else return;
-    } else if (k === 'path' && v.startsWith('/')) c.path = v;
-    else if (k === 'expires') { const t = Date.parse(v); if (!isNaN(t)) c.exp = t; }
-    else if (k === 'max-age') { const n = parseInt(v, 10); if (!isNaN(n)) maxAge = n; }
-    else if (k === 'secure') c.secure = true;
-    else if (k === 'httponly' && !fromJs) c.httpOnly = true;
-  }
-  if (maxAge !== null) c.exp = maxAge <= 0 ? 1 : Date.now() + maxAge * 1000;
-  jar = jar.filter(x => !(x.name === c.name && x.domain === c.domain && x.path === c.path));
-  if (!(c.exp && c.exp <= Date.now())) jar.push(c);
-  saveJar();
-}
-function storeCookies(res, url) {
-  let list = [];
-  if (Array.isArray(res.raw_headers)) list = res.raw_headers.filter(h => String(h[0]).toLowerCase() === 'set-cookie').map(h => h[1]);
-  else { const v = res.headers.get('set-cookie'); if (v) list = v.split(/,(?=\s*[^;,=\s]+=[^;,]*)/); }
-  list.forEach(s => setCookieStr(s, url, false));
-}
-
-/* pages are identified by a random key so a page can only touch its own cookies/storage */
-const pageKeys = new Map();
-function registerPage(url) {
-  const key = Array.from(crypto.getRandomValues(new Uint8Array(10)), b => b.toString(16).padStart(2, '0')).join('');
-  let origin = 'null'; try { origin = new URL(url).origin; } catch {}
-  pageKeys.set(key, { url, origin });
-  if (pageKeys.size > 300) pageKeys.delete(pageKeys.keys().next().value);
-  return key;
-}
-
-/* ================= network layer (everything goes through libcurl) ================= */
-async function fetchRaw(url, { method = 'GET', headers = {}, body, cred = 'include', referer } = {}) {
-  const h = { 'User-Agent': navigator.userAgent, ...headers };
-  if (referer && !hasHeader(h, 'referer')) h['Referer'] = referer;
-  const isGet = /^(GET|HEAD)$/i.test(method);
-  if (referer && !hasHeader(h, 'origin')) {
-    try { const o = new URL(referer).origin; if (!isGet || o !== new URL(url).origin) h['Origin'] = o; } catch {}
-  }
-  if (cred !== 'omit' && !hasHeader(h, 'cookie')) { const c = cookieHeader(url); if (c) h['Cookie'] = c; }
-  const init = { method, headers: h, redirect: 'follow' };
-  if (body != null && !isGet) init.body = typeof body === 'string' ? body : new Uint8Array(body);
-  const res = await libcurl.fetch(url, init);
-  storeCookies(res, res.url || url);
-  return res;
-}
-const reply = (src, m, tr = []) => { try { src.postMessage({ miniRes: 1, ...m }, '*', tr); } catch {} };
-
-async function onFetch(d, src) {
-  try {
-    if (!/^https?:/i.test(d.url)) throw new Error('Unsupported protocol');
-    const res = await fetchRaw(d.url, { method: d.method || 'GET', headers: Object.fromEntries(d.headers || []),
-                                        body: d.body, cred: d.cred, referer: d.page });
-    const buf = await res.arrayBuffer();
-    const headers = [...res.headers.entries()].filter(([k]) => k.toLowerCase() !== 'set-cookie');
-    reply(src, { id: d.id, status: res.status, statusText: res.statusText || '', headers, url: res.url || d.url, body: buf }, [buf]);
-  } catch (err) { reply(src, { id: d.id, error: String(err && err.message || err) }); }
-}
-async function onFrame(d, src, hops) {
-  try {
-    if (!/^https?:/i.test(d.url)) throw new Error('bad url');
-    const res = await fetchRaw(d.url, { method: d.method || 'GET', body: d.body, referer: d.referer,
-                                        headers: d.contentType ? { 'Content-Type': d.contentType } : {} });
-    const buf = await res.arrayBuffer();
-    const ctype = (res.headers.get('content-type') || '').toLowerCase();
-    if (/attachment/i.test(res.headers.get('content-disposition') || '') || (ctype && !/text\/html|application\/xhtml/.test(ctype)))
-      return reply(src, { id: d.id, html: null });
-    reply(src, { id: d.id, html: buildPage(buf, ctype, res.url || d.url, hops + 1, false).html });
-  } catch (err) { reply(src, { id: d.id, html: null }); }
-}
-
-/* ================= injected into every proxied page (runs inside the sandboxed iframe) ================= */
-function MINI_SHIM(M) {
-  'use strict';
-  var D = M.depth, isSub = D > 1, BASE = M.url;
-  var T = window; for (var i = 0; i < D; i++) T = T.parent;          // the browser window
-  var skip = /^(#|javascript:|mailto:|tel:|sms:|data:|blob:|about:)/i;
-
-  function post(m, tr) { try { T.postMessage(Object.assign({ mini: 1, key: M.key }, m), '*', tr || []); } catch (e) {} }
-  function abs(u) { try { return new URL(u, document.baseURI).href; } catch (e) { return null; } }
-  function def(o, k, d) { try { Object.defineProperty(o, k, d); } catch (e) {} }
-  function decode(buf, ct) {
-    var m = /charset=([^;\s]+)/i.exec(ct || '');
-    try { return new TextDecoder(m ? m[1] : 'utf-8').decode(buf); } catch (e) { return new TextDecoder().decode(buf); }
-  }
-
-  /* ---- the sandbox has no real origin, so cookies/storage must be emulated ---- */
-  def(document, 'URL', { get: function () { return BASE; } });
-  def(document, 'documentURI', { get: function () { return BASE; } });
-  try { var host = new URL(BASE).hostname; def(document, 'domain', { get: function () { return host; }, set: function () {} }); } catch (e) {}
-
-  var cj = {};
-  (M.cookie || '').split('; ').forEach(function (p) { var i = p.indexOf('='); if (i > 0) cj[p.slice(0, i)] = p.slice(i + 1); });
-  def(document, 'cookie', {
-    get: function () { return Object.keys(cj).map(function (k) { return k + '=' + cj[k]; }).join('; '); },
-    set: function (s) {
-      s = String(s); var parts = s.split(';'), i = parts[0].indexOf('=');
-      var name = i >= 0 ? parts[0].slice(0, i).trim() : '', val = i >= 0 ? parts[0].slice(i + 1).trim() : parts[0].trim();
-      var dead = /max-age\s*=\s*(0|-)/i.test(s) || (/expires\s*=([^;]+)/i.test(s) && Date.parse(/expires\s*=([^;]+)/i.exec(s)[1]) < Date.now());
-      if (dead) delete cj[name]; else cj[name] = val;
-      post({ type: 'cookie', str: s });
-    }
-  });
-
-  function makeStorage(initial, onChange) {
-    var data = Object.create(null); for (var k in initial) data[k] = String(initial[k]);
-    var api = {
-      getItem: function (k) { k = String(k); return k in data ? data[k] : null; },
-      setItem: function (k, v) { data[String(k)] = String(v); onChange(data); },
-      removeItem: function (k) { delete data[String(k)]; onChange(data); },
-      clear: function () { for (var k in data) delete data[k]; onChange(data); },
-      key: function (i) { var ks = Object.keys(data); return i < ks.length ? ks[i] : null; }
-    };
-    return new Proxy(api, {
-      get: function (t, p) { if (p === 'length') return Object.keys(data).length; if (p in t) return t[p]; return typeof p === 'string' && p in data ? data[p] : undefined; },
-      set: function (t, p, v) { if (typeof p === 'string') { data[p] = String(v); onChange(data); } return true; },
-      deleteProperty: function (t, p) { delete data[p]; onChange(data); return true; },
-      has: function (t, p) { return p in t || p in data; },
-      ownKeys: function () { return Object.keys(data); },
-      getOwnPropertyDescriptor: function (t, p) { return p in data ? { value: data[p], enumerable: true, configurable: true, writable: true } : undefined; }
-    });
-  }
-  var lsTimer = 0;
-  var ls = makeStorage(M.ls || {}, function (data) {
-    clearTimeout(lsTimer);
-    lsTimer = setTimeout(function () { post({ type: 'ls', data: JSON.stringify(data) }); }, 300);
-  });
-  var ss = makeStorage({}, function () {});
-  def(window, 'localStorage', { get: function () { return ls; }, configurable: true });
-  def(window, 'sessionStorage', { get: function () { return ss; }, configurable: true });
-
-  /* ---- request bridge: fetch / XHR / beacon go through the proxy, so CORS & CSP don't apply ---- */
-  var seq = 0, waiting = {};
-  window.addEventListener('message', function (e) {
-    var d = e.data;
-    if (!d || !d.miniRes || e.source !== T) return;
-    var w = waiting[d.id]; if (!w) return;
-    delete waiting[d.id];
-    if (d.error) w.rej(new TypeError(d.error)); else w.res(d);
-  });
-  function call(type, payload, tr) {
-    return new Promise(function (res, rej) {
-      var id = ++seq; waiting[id] = { res: res, rej: rej };
-      post(Object.assign({ type: type, id: id }, payload), tr);
-    });
-  }
-  function headerPairs(h) { var a = []; h.forEach(function (v, k) { a.push([k, v]); }); return a; }
-
-  var origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    var req;
-    try { req = new Request(input, init); } catch (e) { return origFetch.apply(this, arguments); }
-    if (!/^https?:/i.test(req.url)) return origFetch.apply(this, arguments);
-    return new Promise(function (resolve, reject) {
-      var sig = req.signal;
-      if (sig) {
-        if (sig.aborted) return reject(new DOMException('The operation was aborted.', 'AbortError'));
-        sig.addEventListener('abort', function () { reject(new DOMException('The operation was aborted.', 'AbortError')); });
-      }
-      var isGet = /^(GET|HEAD)$/i.test(req.method);
-      (isGet ? Promise.resolve(null) : req.arrayBuffer()).then(function (buf) {
-        var hasBody = buf && buf.byteLength;
-        return call('fetch', { url: req.url, method: req.method, headers: headerPairs(req.headers), body: hasBody ? buf : null,
-                               page: BASE, cred: req.credentials }, hasBody ? [buf] : []);
-      }).then(function (r) {
-        var hs = new Headers();
-        r.headers.forEach(function (p) { try { hs.append(p[0], p[1]); } catch (e) {} });
-        var nullBody = [101, 204, 205, 304].indexOf(r.status) >= 0 || req.method === 'HEAD';
-        var st = r.status >= 200 && r.status <= 599 ? r.status : 200;
-        var res = new Response(nullBody ? null : r.body, { status: st, statusText: r.statusText, headers: hs });
-        def(res, 'url', { value: r.url });
-        def(res, 'redirected', { value: r.url !== req.url });
-        resolve(res);
-      }).catch(reject);
-    });
-  };
-
-  class MiniXHR extends EventTarget {
-    constructor() {
-      super();
-      this.readyState = 0; this.status = 0; this.statusText = ''; this.response = null; this.responseText = '';
-      this.responseURL = ''; this.responseType = ''; this.timeout = 0; this.withCredentials = false;
-      this.upload = new EventTarget(); this._h = []; this._rh = []; this._gen = 0;
-    }
-    _fire(type, prog) {
-      var ev;
-      try { ev = prog ? new ProgressEvent(type, prog) : new Event(type); } catch (e) { ev = new Event(type); }
-      this.dispatchEvent(ev);
-      var h = this['on' + type]; if (typeof h === 'function') { try { h.call(this, ev); } catch (e) { setTimeout(function () { throw e; }); } }
-    }
-    _state(n) { this.readyState = n; this._fire('readystatechange'); }
-    open(method, url, async) {
-      this._m = String(method || 'GET').toUpperCase(); this._u = abs(url); this._h = []; this._rh = [];
-      if (async === false) console.warn('[mini] synchronous XHR is not supported; running asynchronously');
-      this._state(1);
-    }
-    setRequestHeader(k, v) { this._h.push([k, v]); }
-    overrideMimeType(m) { this._mime = m; }
-    getResponseHeader(k) {
-      k = String(k).toLowerCase(); var out = [];
-      this._rh.forEach(function (p) { if (p[0].toLowerCase() === k) out.push(p[1]); });
-      return out.length ? out.join(', ') : null;
-    }
-    getAllResponseHeaders() { return this._rh.map(function (p) { return p[0] + ': ' + p[1]; }).join('\r\n') + (this._rh.length ? '\r\n' : ''); }
-    abort() {
-      if (!this._busy) return;
-      this._gen++; this._busy = false; this.readyState = 0; this.status = 0;
-      this._fire('abort'); this._fire('loadend');
-    }
-    send(body) {
-      var self = this, gen = ++this._gen, m = this._m || 'GET', url = this._u;
-      if (!url || !/^https?:/i.test(url)) { setTimeout(function () { self._fail('error', gen); }, 0); return; }
-      this._busy = true; this._fire('loadstart', { loaded: 0, total: 0 });
-      var hdrs = this._h.slice(), prep;
-      if (body == null || /^(GET|HEAD)$/.test(m)) prep = Promise.resolve(null);
-      else {
-        var rq; try { rq = new Request(url, { method: 'POST', body: body }); } catch (e) { rq = null; }
-        prep = rq ? rq.arrayBuffer().then(function (buf) {
-          var hasCT = hdrs.some(function (p) { return p[0].toLowerCase() === 'content-type'; });
-          var ct = rq.headers.get('content-type'); if (!hasCT && ct) hdrs.push(['Content-Type', ct]);
-          return buf;
-        }) : Promise.resolve(String(body));
-      }
-      var timer = this.timeout > 0 ? setTimeout(function () { self._fail('timeout', gen); }, this.timeout) : 0;
-      prep.then(function (buf) {
-        return call('fetch', { url: url, method: m, headers: hdrs, body: buf, page: BASE, cred: self.withCredentials ? 'include' : 'same-origin' },
-                    buf && typeof buf !== 'string' ? [buf] : []);
-      }).then(function (r) {
-        if (gen !== self._gen) return;
-        clearTimeout(timer);
-        self.status = r.status; self.statusText = r.statusText; self.responseURL = r.url; self._rh = r.headers;
-        self._state(2);
-        var ct = self.getResponseHeader('content-type') || self._mime || '', rt = self.responseType, text;
-        if (rt === 'arraybuffer') self.response = r.body;
-        else if (rt === 'blob') self.response = new Blob([r.body], { type: ct });
-        else {
-          text = decode(r.body, ct); self.responseText = text;
-          if (rt === 'json') { try { self.response = JSON.parse(text); } catch (e) { self.response = null; } }
-          else if (rt === 'document') { try { self.response = new DOMParser().parseFromString(text, /xml/i.test(ct) ? 'text/xml' : 'text/html'); } catch (e) { self.response = null; } }
-          else self.response = text;
-        }
-        self._state(3); self._busy = false; self._state(4);
-        var n = r.body.byteLength, p = { loaded: n, total: n, lengthComputable: true };
-        self._fire('progress', p); self._fire('load', p); self._fire('loadend', p);
-      }).catch(function () { clearTimeout(timer); self._fail('error', gen); });
-    }
-    _fail(type, gen) {
-      if (gen !== this._gen) return;
-      this._busy = false; this.status = 0; this.readyState = 4;
-      this._fire('readystatechange'); this._fire(type); this._fire('loadend');
-    }
-  }
-  ['UNSENT', 'OPENED', 'HEADERS_RECEIVED', 'LOADING', 'DONE'].forEach(function (n, i) { def(MiniXHR, n, { value: i }); def(MiniXHR.prototype, n, { value: i }); });
-  window.XMLHttpRequest = MiniXHR;
-  navigator.sendBeacon = function (u, data) { try { window.fetch(u, { method: 'POST', body: data, keepalive: true }).catch(function () {}); return true; } catch (e) { return false; } };
-
-  /* ---- navigation ---- */
-  function go(url, extra) {
-    if (!url) return;
-    if (isSub) { try { parent.postMessage(Object.assign({ miniFrameNav: 1, url: url }, extra || {}), '*'); } catch (e) {} }
-    else post(Object.assign({ type: 'nav', url: url }, extra || {}));
-  }
-
-  // bubble phase on window: runs AFTER the page's own handlers, so SPA routers / ajax forms keep working
-  window.addEventListener('click', function (e) {
+  document.addEventListener('click', function(e){
     if (e.defaultPrevented) return;
-    var a = e.target && e.target.closest ? e.target.closest('a[href], area[href]') : null;
+    var a = e.target.closest && e.target.closest('a[href], area[href]');
     if (!a) return;
-    var raw = (a.getAttribute('href') || '').trim();
-    if (!raw || /^(javascript:|mailto:|tel:|sms:|data:|blob:|about:)/i.test(raw)) return;
+    var raw = a.getAttribute('href');
+    if (!raw || skip.test(raw.trim())) return;
     e.preventDefault();
-    if (raw.charAt(0) === '#') {                 // with <base>, native fragment links would leave the document
-      if (raw === '#' || raw.toLowerCase() === '#top') window.scrollTo(0, 0); else location.hash = raw.slice(1);
-      return;
-    }
-    if (a.hasAttribute('download')) { post({ type: 'download', url: a.href, name: a.getAttribute('download') }); return; }
-    go(a.href);
-  });
-  window.addEventListener('auxclick', function (e) {
-    if (e.defaultPrevented || e.button !== 1) return;
-    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-    var raw = a && (a.getAttribute('href') || '').trim();
-    if (a && raw && !skip.test(raw)) { e.preventDefault(); go(a.href); }
-  });
+    if (a.hasAttribute('download')) { P({type:'download', url:a.href, name:a.getAttribute('download')}); return; }
+    P({type:'nav', url:a.href});
+  }, true);
 
-  function doSubmit(f, sub) {
+  document.addEventListener('auxclick', function(e){
+    var a = e.target.closest && e.target.closest('a[href]');
+    if (e.button === 1 && a) {
+      e.preventDefault();
+      var raw = a.getAttribute('href');
+      if (raw && !skip.test(raw.trim())) P({type:'nav', url:a.href});
+    }
+  }, true);
+
+  document.addEventListener('submit', function(e){
+    var f = e.target; if (e.defaultPrevented) return;
+    e.preventDefault();
+    var sub = e.submitter;
     var action = (sub && sub.getAttribute('formaction')) || f.getAttribute('action');
-    var url = action ? abs(action) : BASE.split('#')[0];
-    if (!url || !/^https?:/i.test(url)) return;
+    var url = action ? new URL(action, document.baseURI).href : document.baseURI;
     var method = ((sub && sub.getAttribute('formmethod')) || f.getAttribute('method') || 'get').toLowerCase();
-    var enc = ((sub && sub.getAttribute('formenctype')) || f.getAttribute('enctype') || '').toLowerCase();
     var fd = new FormData(f);
     if (sub && sub.name) fd.append(sub.name, sub.value);
+    var usp = new URLSearchParams();
+    fd.forEach(function(v,k){ usp.append(k, typeof v === 'string' ? v : (v.name || '')); });
     if (method === 'post') {
-      if (enc.indexOf('multipart') === 0) {
-        var rq = new Request(url, { method: 'POST', body: fd });
-        rq.arrayBuffer().then(function (buf) { go(url, { method: 'POST', body: buf, contentType: rq.headers.get('content-type') }); });
-      } else {
-        var usp = new URLSearchParams();
-        fd.forEach(function (v, k) { usp.append(k, typeof v === 'string' ? v : (v.name || '')); });
-        go(url, { method: 'POST', body: usp.toString(), contentType: 'application/x-www-form-urlencoded' });
-      }
+      P({type:'nav', url:url, method:'POST', body:usp.toString(), contentType:'application/x-www-form-urlencoded'});
     } else {
-      var u = new URL(url), q = new URLSearchParams();
-      fd.forEach(function (v, k) { q.append(k, typeof v === 'string' ? v : (v.name || '')); });
-      u.search = ''; q.forEach(function (v, k) { u.searchParams.append(k, v); }); u.hash = '';
-      go(u.href);
+      var u = new URL(url); u.search = ''; usp.forEach(function(v,k){ u.searchParams.append(k, v); }); u.hash = '';
+      P({type:'nav', url:u.href});
     }
-  }
-  window.addEventListener('submit', function (e) {
-    if (e.defaultPrevented) return;
-    e.preventDefault(); doSubmit(e.target, e.submitter);
-  });
-  HTMLFormElement.prototype.submit = function () { doSubmit(this, null); };   // form.submit() fires no event
-
-  // location.href = ..., location.reload(), etc. -> same route
-  if (window.navigation && navigation.addEventListener) {
-    navigation.addEventListener('navigate', function (e) {
-      try {
-        if (e.navigationType === 'traverse' || e.destination.sameDocument || !e.cancelable) return;
-        if (e.navigationType === 'reload') { if (!isSub) { e.preventDefault(); post({ type: 'reload' }); } return; }
-        var u = e.destination.url;
-        if (!/^https?:/i.test(u)) return;
-        e.preventDefault();
-        var hashAt = u.indexOf('#');
-        if (hashAt >= 0 && u.slice(0, hashAt) === BASE.split('#')[0]) location.hash = u.slice(hashAt + 1);
-        else go(u);
-      } catch (x) {}
-    });
-  }
-
-  // pushState with a URL on another origin throws in a sandboxed srcdoc; keep SPAs alive and tell the browser the new URL
-  ['pushState', 'replaceState'].forEach(function (k) {
-    var orig = history[k];
-    history[k] = function (s, t, u) {
-      var real = u != null ? abs(u) : null;
-      try { orig.apply(history, arguments); } catch (e) { try { orig.call(history, s, t); } catch (e2) {} }
-      if (real && !isSub && /^https?:/i.test(real)) post({ type: 'hash', url: real });
-    };
-  });
-  window.addEventListener('hashchange', function () { if (!isSub) post({ type: 'hash', url: BASE.split('#')[0] + location.hash }); });
-
-  var fakeWin = { closed: false, close: function () {}, focus: function () {}, blur: function () {}, postMessage: function () {},
-                  document: { write: function () {}, writeln: function () {}, close: function () {}, open: function () {} },
-                  location: { href: '', assign: function () {}, replace: function () {} } };
-  window.open = function (u) { if (u && !skip.test(String(u).trim())) go(abs(u)); return fakeWin; };
-  document.addEventListener('DOMContentLoaded', function () {
-    document.querySelectorAll('a[target], form[target]').forEach(function (n) { n.removeAttribute('target'); });
-  });
-
-  /* ---- iframes: load through the proxy so X-Frame-Options / CSP frame rules don't block them ---- */
-  function loadFrame(el, spec, raw) {
-    call('frame', { url: spec.url, method: spec.method, body: spec.body, contentType: spec.contentType, referer: BASE })
-      .then(function (r) {
-        if (r.html != null) { el.removeAttribute('src'); el.srcdoc = r.html; }
-        else if (raw) { el.__miniSkip = raw; el.setAttribute('src', raw); }
-      }).catch(function () { if (raw) { el.__miniSkip = raw; el.setAttribute('src', raw); } });
-  }
-  function watchFrame(el) {
-    if (el.hasAttribute('srcdoc')) return;
-    var raw = el.getAttribute('src'); if (!raw) return;
-    if (el.__miniSkip === raw) return;
-    raw = raw.trim(); if (skip.test(raw)) return;
-    var u = abs(raw); if (!u || !/^https?:/i.test(u)) return;
-    el.removeAttribute('src');
-    loadFrame(el, { url: u }, raw);
-  }
-  function scan(n) {
-    if (n.nodeType !== 1) return;
-    if (n.tagName === 'IFRAME') watchFrame(n);
-    if (n.querySelectorAll) n.querySelectorAll('iframe').forEach(watchFrame);
-  }
-  new MutationObserver(function (ms) {
-    ms.forEach(function (m) {
-      if (m.type === 'attributes') { if (m.target.tagName === 'IFRAME') watchFrame(m.target); }
-      else m.addedNodes.forEach(scan);
-    });
-  }).observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
-  // navigation requests coming from inside a nested frame
-  window.addEventListener('message', function (e) {
-    var d = e.data; if (!d || !d.miniFrameNav) return;
-    var fr = document.getElementsByTagName('iframe');
-    for (var i = 0; i < fr.length; i++) if (fr[i].contentWindow === e.source) {
-      if (/^https?:/i.test(d.url)) loadFrame(fr[i], d, null);
-      return;
-    }
-  });
-
-  /* ---- subresources that fail natively (hotlink/CORS/mixed content) get a second try through the proxy ---- */
-  function fixCss(css, base) {
-    function A(p) { try { return new URL(p, base).href; } catch (e) { return null; } }
-    return css.replace(/url\(\s*(['"]?)(?!data:|blob:|https?:|#)([^)'"]+?)\1\s*\)/gi, function (m, q, p) { var a = A(p); return a ? 'url("' + a + '")' : m; })
-              .replace(/@import\s+(['"])(?!https?:)([^'"]+)\1/gi, function (m, q, p) { var a = A(p); return a ? '@import "' + a + '"' : m; });
-  }
-  window.addEventListener('error', function (e) {
-    var el = e.target;
-    if (!el || el === window || !el.tagName || el.__retry) return;
-    var tag = el.tagName, attr = tag === 'LINK' ? 'href' : 'src';
-    if (tag === 'LINK' ? !/stylesheet/i.test(el.rel || '') : (tag !== 'SCRIPT' && tag !== 'IMG')) return;
-    var u = abs(el.getAttribute(attr) || ''); if (!u || !/^https?:/i.test(u)) return;
-    el.__retry = 1;
-    call('fetch', { url: u, method: 'GET', headers: [], body: null, page: BASE, cred: 'omit' }).then(function (r) {
-      if (r.status >= 400) return;
-      var ct = (r.headers.filter(function (p) { return p[0].toLowerCase() === 'content-type'; })[0] || [0, ''])[1];
-      if (tag === 'SCRIPT') {
-        var s = document.createElement('script');
-        for (var i = 0; i < el.attributes.length; i++) { var n = el.attributes[i].name; if (!/^(src|integrity|crossorigin)$/i.test(n)) s.setAttribute(n, el.attributes[i].value); }
-        s.async = false; s.__retry = 1;
-        s.src = URL.createObjectURL(new Blob([r.body], { type: 'text/javascript' }));
-        el.parentNode && el.parentNode.insertBefore(s, el.nextSibling);
-      } else if (tag === 'LINK') {
-        var l = document.createElement('link'); l.rel = 'stylesheet'; if (el.media) l.media = el.media; l.__retry = 1;
-        l.href = URL.createObjectURL(new Blob([fixCss(decode(r.body, ct), u)], { type: 'text/css' }));
-        el.parentNode && el.parentNode.insertBefore(l, el.nextSibling);
-      } else {
-        el.removeAttribute('srcset'); el.src = URL.createObjectURL(new Blob([r.body], { type: ct || 'image/*' }));
-      }
-    }).catch(function () {});
   }, true);
 
-  /* ---- keyboard shortcuts keep working while the page has focus ---- */
-  document.addEventListener('keydown', function (e) {
-    if (isSub) return;
-    if (e.altKey || e.ctrlKey || e.metaKey || e.key === 'Escape') {
+  // no tabs: popups and target=_blank load in the same view
+  window.open = function(u){ if (u) P({type:'nav', url:new URL(u, document.baseURI).href}); return null; };
+  document.addEventListener('DOMContentLoaded', function(){
+    document.querySelectorAll('a[target], form[target]').forEach(function(n){ n.removeAttribute('target'); });
+  });
+  window.addEventListener('hashchange', function(){ P({type:'hash', url:document.baseURI.split('#')[0] + location.hash}); });
+
+  // keyboard shortcuts keep working while the page has focus
+  document.addEventListener('keydown', function(e){
+    if ((e.altKey || e.ctrlKey || e.metaKey) || e.key === 'Escape') {
+      var k = {type:'key', key:e.key, alt:e.altKey, ctrl:e.ctrlKey, meta:e.metaKey};
       if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
-      post({ type: 'key', key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey });
+      P(k);
     }
   }, true);
-}
-
-/* ================= HTML preparation ================= */
-function buildPage(buf, ctype, finalUrl, depth, canRedirect) {
-  let html = decodeBody(buf, ctype);
-
-  if (canRedirect) {
-    const mr = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["']?\s*\d*\s*;?\s*url=\s*['"]?([^'">\s]+)/i.exec(html);
-    if (mr) { const u = resolveUrl(decodeEntities(mr[1]), finalUrl); if (u && u !== finalUrl) return { redirect: u }; }
-  }
-
-  const pb = /<base[^>]+href=["']([^"']+)["']/i.exec(html);
-  const baseHref = pb ? (resolveUrl(pb[1], finalUrl) || finalUrl) : finalUrl;
-
-  html = html.replace(/<meta[^>]+http-equiv=["']?(content-security-policy|x-frame-options|refresh)["']?[^>]*>/gi, '')
-             .replace(/<base\b[^>]*>/gi, '')
-             .replace(/\sintegrity=("[^"]*"|'[^']*')/gi, '')
-             .replace(/\scrossorigin(=("[^"]*"|'[^']*'|[^\s>]+))?/gi, '');
-
-  const key = registerPage(finalUrl);
-  let origin = 'null'; try { origin = new URL(finalUrl).origin; } catch {}
-  let lsData = {}; try { lsData = JSON.parse(store.get('mini:ls:' + origin) || '{}'); } catch {}
-  const boot = { url: finalUrl, depth, key, cookie: pageCookies(finalUrl), ls: lsData };
-
-  const inject = `<base href="${baseHref.replace(/"/g, '&quot;')}">` +
-    '<scr' + 'ipt>(' + MINI_SHIM.toString() + ')(' + safeJson(boot) + ');</scr' + 'ipt>';
-  if (/<head(\s[^>]*)?>/i.test(html)) html = html.replace(/<head(\s[^>]*)?>/i, m => m + inject);
-  else if (/<html(\s[^>]*)?>/i.test(html)) html = html.replace(/<html(\s[^>]*)?>/i, m => m + '<head>' + inject + '</head>');
-  else html = '<!DOCTYPE html><head>' + inject + '</head>' + html;
-  return { html };
-}
+})();<\/script>`;
 
 /* ================= core loader ================= */
 async function navigate(target, opts = {}) {
-  const { method = 'GET', body, contentType, push = true, metaDepth = 0, referer } = opts;
+  const { method = 'GET', body, contentType, push = true, metaDepth = 0 } = opts;
   if (!ready) { pending = { target, opts }; setStatus('Waiting for runtime…'); return; }
   const my = ++token;
   setLoading(true);
   setStatus('Loading ' + target + '…');
 
   try {
-    const headers = {};
+    const headers = { 'User-Agent': navigator.userAgent };
     if (body != null) headers['Content-Type'] = contentType || 'application/x-www-form-urlencoded';
-    const res = await fetchRaw(target, { method, headers, body, referer });
+    const init = { method, headers, redirect: 'follow' };
+    if (body != null && method !== 'GET') init.body = body;
+
+    const res = await libcurl.fetch(target, init);
     if (my !== token) return;
 
     const finalUrl = res.url || target;
@@ -657,10 +225,28 @@ async function navigate(target, opts = {}) {
     let page;
     const isHtml = !ctype || /text\/html|application\/xhtml/.test(ctype);
     if (isHtml) {
-      const built = buildPage(buf, ctype, finalUrl, 1, metaDepth < MAX_META_REFRESH);
-      if (built.redirect) return navigate(built.redirect, { push, metaDepth: metaDepth + 1 });
-      page = { html: built.html };
-    } else if (/^(image|video|audio)\/|application\/pdf|^text\/|json|xml|javascript|ecmascript/.test(ctype)) {
+      let html = decodeBody(buf, ctype);
+
+      const mr = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["']?\s*\d*\s*;?\s*url=\s*['"]?([^'">\s]+)/i.exec(html);
+      if (mr && metaDepth < MAX_META_REFRESH) {
+        const u = resolveUrl(decodeEntities(mr[1]), finalUrl);
+        if (u && u !== finalUrl) return navigate(u, { push, metaDepth: metaDepth + 1 });
+      }
+
+      const pb = /<base[^>]+href=["']([^"']+)["']/i.exec(html);
+      const baseHref = pb ? (resolveUrl(pb[1], finalUrl) || finalUrl) : finalUrl;
+
+      html = html.replace(/<meta[^>]+http-equiv=["']?(content-security-policy|x-frame-options|refresh)["']?[^>]*>/gi, '')
+                 .replace(/<base\b[^>]*>/gi, '')
+                 .replace(/\sintegrity=("[^"]*"|'[^']*')/gi, '')
+                 .replace(/\scrossorigin(=("[^"]*"|'[^']*'|[^\s>]+))?/gi, '');
+
+      const inject = `<base href="${baseHref.replace(/"/g, '&quot;')}">` + INJECT;
+      if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, m => m + inject);
+      else if (/<html[^>]*>/i.test(html)) html = html.replace(/<html[^>]*>/i, m => m + '<head>' + inject + '</head>');
+      else html = '<!DOCTYPE html><head>' + inject + '</head>' + html;
+      page = { html };
+    } else if (/^(image|video|audio)\/|application\/pdf|^text\/|json|xml/.test(ctype)) {
       page = { blob: new Blob([buf], { type: ctype }) };
     } else {
       return finishDownload();
@@ -707,7 +293,7 @@ function showError(target, err) {
 async function downloadUrl(url, name) {
   try {
     setStatus('Downloading…');
-    const res = await fetchRaw(url, { referer: idx >= 0 ? history_[idx].url : undefined });
+    const res = await libcurl.fetch(url, { headers: { 'User-Agent': navigator.userAgent } });
     saveBlob(new Blob([await res.arrayBuffer()], { type: res.headers.get('content-type') || '' }),
              name || filenameFrom(res.headers.get('content-disposition'), res.url || url));
     setStatus('Download complete', 'ok');
@@ -723,51 +309,29 @@ function handleKey(k) {
   const key = (k.key || '').toLowerCase(), mod = k.ctrl || k.meta;
   if (k.alt && k.key === 'ArrowLeft') goBack();
   else if (k.alt && k.key === 'ArrowRight') goForward();
-  else if (k.alt && k.shift && key === 'delete') { jar = []; store.clearAll(); setStatus('Cookies and site data cleared', 'ok'); }
   else if (k.alt && key === 'r') reload();
   else if ((mod || k.alt) && key === 'l') showHome(true);
   else if (k.alt && key === 'home') { showHome(true); }
   else if (k.key === 'Escape' && idx >= 0 && !home.classList.contains('hidden')) showHome(false);
 }
 document.addEventListener('keydown', e => {
-  const k = { key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey };
+  const k = { key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey };
   if (e.altKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l')) e.preventDefault();
   handleKey(k);
 });
 
-/* ================= messages from proxied pages (main page and nested frames) ================= */
-// hops from a window up to this one, or 0 if it isn't inside the view iframe
-function hopsFrom(w) {
-  try {
-    let n = 0, x = w;
-    while (x && x !== window && n < 10) {
-      n++;
-      if (x.parent === window) return x === view.contentWindow ? n : 0;
-      x = x.parent;
-    }
-  } catch {}
-  return 0;
-}
+/* ================= messages from proxied pages ================= */
 window.addEventListener('message', e => {
   const d = e.data;
-  if (!d || !d.mini) return;
-  const hops = hopsFrom(e.source);
-  if (!hops) return;
-  const pg = pageKeys.get(d.key);
-  const top = hops === 1;
-  switch (d.type) {
-    case 'fetch': onFetch(d, e.source); break;
-    case 'frame': onFrame(d, e.source, hops); break;
-    case 'cookie': if (pg && typeof d.str === 'string') setCookieStr(d.str, pg.url, true); break;
-    case 'ls': if (pg && typeof d.data === 'string' && d.data.length < 4e6) store.set('mini:ls:' + pg.origin, d.data); break;
-    case 'nav':
-      if (top && /^https?:/i.test(d.url))
-        navigate(d.url, { method: d.method || 'GET', body: d.body, contentType: d.contentType, referer: idx >= 0 ? history_[idx].url : undefined });
-      break;
-    case 'download': if (top && /^https?:/i.test(d.url)) downloadUrl(d.url, d.name); break;
-    case 'hash': if (top && idx >= 0 && /^https?:/i.test(d.url)) history_[idx] = { ...history_[idx], url: d.url }; break;
-    case 'reload': if (top) reload(); break;
-    case 'key': if (top) handleKey(d); break;
+  if (!d || !d.mini || e.source !== view.contentWindow) return;
+  if (d.type === 'nav' && /^https?:/i.test(d.url)) {
+    navigate(d.url, { method: d.method || 'GET', body: d.body, contentType: d.contentType });
+  } else if (d.type === 'download') {
+    downloadUrl(d.url, d.name);
+  } else if (d.type === 'hash') {
+    if (idx >= 0) history_[idx] = { ...history_[idx], url: d.url };
+  } else if (d.type === 'key') {
+    handleKey(d);
   }
 });
 
